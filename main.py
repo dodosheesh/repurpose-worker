@@ -3,10 +3,21 @@ import subprocess
 import requests
 import uuid
 from fastapi import FastAPI, HTTPException, Header, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 
 app = FastAPI()
+
+# ✅ CORS — FIXES "failed to fetch"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "")
 
 # simple in-memory task store (MVP)
