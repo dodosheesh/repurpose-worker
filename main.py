@@ -1,12 +1,16 @@
 import os
 import subprocess
 import requests
-from fastapi import FastAPI, HTTPException, Header
+import uuid
+from fastapi import FastAPI, HTTPException, Header, Query
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
 
 app = FastAPI()
 WORKER_API_KEY = os.getenv("WORKER_API_KEY", "")
+
+# simple in-memory task store (MVP)
+TASKS = {}
 
 
 class ProcessRequest(BaseModel):
@@ -24,6 +28,11 @@ def require_auth(auth_header: Optional[str]):
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
+@app.get("/")
+def root():
+    return {"ok": True, "service": "repurpose-worker"}
+
+
 @app.get("/health")
 def health():
     try:
@@ -35,100 +44,78 @@ def health():
         return {"ok": False, "error": str(e)}
 
 
+# =========================
+# REQUIRED BY LOVABLE
+# =========================
+@app.get("/status")
+def status(task_id: str = Query(...)):
+    task = TASKS.get(task_id)
+    if not task:
+        return {"task_id": task_id, "status": "not_found"}
+
+    return task
+
+
 @app.post("/process")
 def process(req: ProcessRequest, authorization: Optional[str] = Header(None)):
     require_auth(authorization)
 
+    task_id = str(uuid.uuid4())
+    TASKS[task_id] = {"task_id": task_id, "status": "processing"}
+
     in_path = "/tmp/input.mp4"
     out_path = "/tmp/output.mp4"
 
-    # =========================
-    # DOWNLOAD INPUT
-    # =========================
     try:
+        # ================= DOWNLOAD =================
         r = requests.get(req.input_url, stream=True, timeout=120)
         if r.status_code >= 300:
-            raise HTTPException(
-                status_code=502,
-                detail=f"Download failed: {r.status_code} {r.text[:200]}",
-            )
+            raise Exception(f"Download failed: {r.status_code}")
 
         with open(in_path, "wb") as f:
             for chunk in r.iter_content(1024 * 1024):
                 if chunk:
                     f.write(chunk)
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Download error: {str(e)[:200]}",
-        )
+        # ================= FFMPEG =================
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            in_path,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            out_path,
+        ]
 
-    # =========================
-    # FFMPEG PROCESS
-    # =========================
-    cmd = [
-        "ffmpeg",
-        "-y",
-        "-i",
-        in_path,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "20",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        "-movflags",
-        "+faststart",
-        out_path,
-    ]
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        if p.returncode != 0:
+            raise Exception("ffmpeg failed")
 
-    p = subprocess.run(cmd, capture_output=True, text=True)
-
-    if p.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail=f"ffmpeg failed: {p.stderr[-400:]}",
-        )
-
-    # =========================
-    # UPLOAD OUTPUT
-    # =========================
-    try:
+        # ================= UPLOAD =================
         with open(out_path, "rb") as f:
             headers = {"Content-Type": "video/mp4"}
-            up = requests.put(
-                req.upload_url,
-                data=f,
-                headers=headers,
-                timeout=300,
-            )
-
+            up = requests.put(req.upload_url, data=f, headers=headers, timeout=300)
             if up.status_code >= 300:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Upload failed: {up.status_code} {up.text[:200]}",
-                )
+                raise Exception(f"Upload failed: {up.status_code}")
 
-    except HTTPException:
-        raise
+        TASKS[task_id] = {"task_id": task_id, "status": "completed"}
+        return {"task_id": task_id, "status": "processing"}
+
     except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Upload error: {str(e)[:200]}",
-        )
-
-    return {"ok": True}
-@app.get("/status")
-def status(task_id: str = ""):
-    return {
-        "ok": True,
-        "task_id": task_id,
-        "status": "completed"
-    }
+        TASKS[task_id] = {
+            "task_id": task_id,
+            "status": "failed",
+            "error": str(e),
+        }
+        raise HTTPException(status_code=500, detail=str(e))
