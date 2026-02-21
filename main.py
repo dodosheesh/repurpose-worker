@@ -125,3 +125,10 @@ def process(req: ProcessRequest, authorization: Optional[str] = Header(None)):
         )
 
     return {"ok": True}
+@app.get("/status")
+def status(task_id: str = ""):
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "status": "completed"
+    }
